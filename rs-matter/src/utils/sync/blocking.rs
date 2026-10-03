@@ -153,7 +153,10 @@ pub mod raw {
 
             #[inline(always)]
             fn lock<R>(&self, f: impl FnOnce() -> R) -> R {
-                let _guard = unwrap!(self.0.lock(), "Mutex lock failed");
+                // A panic inside `f` poisons the `std` mutex, which is not an error for a
+                // `RawMutex`: the other raw mutexes carry on after an unwind, and so does
+                // `critical-section`'s own `std` implementation.
+                let _guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
 
                 f()
             }
@@ -200,5 +203,20 @@ mod tests {
 
         // SAFETY: `slot` was initialized by `init_with` above
         unsafe { slot.assume_init_drop() };
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn std_raw_mutex_survives_a_panic_while_locked() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        use super::raw::StdRawMutex;
+
+        let m = Mutex::<_, StdRawMutex>::new(Cell::new(1));
+
+        assert!(catch_unwind(AssertUnwindSafe(|| m.lock(|_| panic!("inside the lock")))).is_err());
+
+        m.lock(|c| c.set(c.get() + 1));
+        assert_eq!(m.lock(|c| c.get()), 2);
     }
 }
