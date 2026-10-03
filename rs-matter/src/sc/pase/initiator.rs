@@ -32,7 +32,8 @@ use crate::sc::pase::spake2p::{
     SPAKE2P_VERIFIER_SALT_LEN, SPAKE2P_VERIFIER_SALT_MIN_LEN,
 };
 use crate::sc::{
-    complete_with_status, GeneralCode, OpCode, SCStatusCodes, SessionParameters, StatusReport,
+    complete_with_status, expect_session_establishment_success, OpCode, SCStatusCodes,
+    SessionParameters, StatusReport,
 };
 use crate::tlv::{FromTLV, OctetStr, TLVElement, TagType, ToTLV};
 use crate::transport::exchange::Exchange;
@@ -344,36 +345,7 @@ impl<C: Crypto> PaseInitiator<C> {
             .await?;
 
         // Receive StatusReport
-        exchange.recv_fetch().await?;
-
-        let rx = exchange.rx()?;
-        let meta = rx.meta();
-
-        // Verify opcode
-        if meta.proto_opcode != OpCode::StatusReport as u8 {
-            error!(
-                "Unexpected opcode: expected StatusReport, got {}",
-                meta.proto_opcode
-            );
-            return Err(ErrorCode::InvalidOpcode.into());
-        }
-
-        // Parse StatusReport
-        let mut rb = ReadBuf::new(rx.payload());
-        let status = StatusReport::read(&mut rb)?;
-
-        // Check for success
-        if status.general_code != GeneralCode::Success
-            || status.proto_code != SCStatusCodes::SessionEstablishmentSuccess as u16
-        {
-            error!(
-                "PASE failed: general={:?}, proto_code={}",
-                status.general_code, status.proto_code
-            );
-            return Err(ErrorCode::Invalid.into());
-        }
-
-        Ok(())
+        expect_session_establishment_success(exchange).await
     }
 
     /// Complete session establishment
