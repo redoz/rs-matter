@@ -33,8 +33,8 @@ use crate::crypto::{
 };
 use crate::error::{Error, ErrorCode};
 use crate::sc::{
-    complete_with_status, GeneralCode, OpCode, SCStatusCodes, SessionParameters, StatusReport,
-    PROTO_ID_SECURE_CHANNEL,
+    complete_with_status, expect_session_establishment_success, OpCode, SCStatusCodes,
+    SessionParameters, StatusReport,
 };
 use crate::tlv::{get_root_node_struct, FromTLV, OctetStr, TLVElement, TLVTag, TLVWrite, ToTLV};
 use crate::transport::exchange::Exchange;
@@ -285,7 +285,7 @@ impl<'a, C: Crypto + 'a> CaseInitiator<'a, C> {
                 "CASE Sigma1 failed: general={:?}, proto_code={}",
                 status.general_code, status.proto_code
             );
-            return Err(status_error(&status));
+            return Err(status.establishment_error());
         }
 
         // We only ever offer resumption when `case-resumption` is on, so a
@@ -497,33 +497,7 @@ impl<'a, C: Crypto + 'a> CaseInitiator<'a, C> {
             .await?;
 
         // Step 8: Receive StatusReport
-        exchange.recv_fetch().await?;
-
-        {
-            let rx = exchange.rx()?;
-            let meta = rx.meta();
-
-            if meta.proto_opcode != OpCode::StatusReport as u8 {
-                error!(
-                    "Unexpected opcode: expected StatusReport, got {}",
-                    meta.proto_opcode
-                );
-                return Err(ErrorCode::InvalidOpcode.into());
-            }
-
-            let mut rb = ReadBuf::new(rx.payload());
-            let status = StatusReport::read(&mut rb)?;
-
-            if status.general_code != GeneralCode::Success
-                || status.proto_code != SCStatusCodes::SessionEstablishmentSuccess as u16
-            {
-                error!(
-                    "CASE failed: general={:?}, proto_code={}",
-                    status.general_code, status.proto_code
-                );
-                return Err(status_error(&status));
-            }
-        }
+        expect_session_establishment_success(&mut exchange).await?;
 
         // Step 9: Derive session keys and complete the session
         {
@@ -776,16 +750,5 @@ impl<'a, C: Crypto + 'a> CaseInitiator<'a, C> {
         );
 
         Ok(())
-    }
-}
-
-/// The error for a failure `StatusReport` received from the CASE responder.
-fn status_error(status: &StatusReport<'_>) -> Error {
-    if status.proto_id == PROTO_ID_SECURE_CHANNEL as u32
-        && status.proto_code == SCStatusCodes::NoSharedTrustRoots as u16
-    {
-        ErrorCode::NoSharedTrustRoots.into()
-    } else {
-        ErrorCode::Invalid.into()
     }
 }
