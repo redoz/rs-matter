@@ -271,12 +271,14 @@ pub trait ImClient<'a>: Sized + Into<Exchange<'a>> {
     /// The *active* subscription phase — server-initiated
     /// `ReportData` messages arriving on new exchanges throughout
     /// the lifetime of the subscription — is **not** covered by
-    /// this method. That requires a listening loop on the
-    /// fabric/peer-node pair and is a separate piece of
-    /// infrastructure to layer on top. Once the
-    /// [`SubscribeEstablished`] is returned, the
-    /// fabric+peer+subscription-id triple identifies the active
-    /// subscription for any such future incoming reports.
+    /// this method. Such reports are routed by the
+    /// [`InteractionModel`](crate::im::InteractionModel) to the
+    /// [`ReportDataHandler`](crate::dm::ReportDataHandler) supplied via
+    /// [`InteractionModel::new_with_reports`](crate::im::InteractionModel::new_with_reports).
+    /// Once the [`SubscribeEstablished`] is returned, the
+    /// fabric+peer+subscription-id triple (see
+    /// [`SubscriptionCtx`](crate::dm::SubscriptionCtx)) identifies the
+    /// active subscription for any such future incoming reports.
     async fn subscribe_with<B>(self, mut build: B) -> Result<SubscribePrimingChunk<'a>, Error>
     where
         B: FnMut(SubscribeReqBuilder<SubscribeSender<'a>>) -> Result<SubscribeSender<'a>, Error>,
