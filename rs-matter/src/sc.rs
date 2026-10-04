@@ -401,6 +401,42 @@ async fn expect_opcode(exchange: &mut Exchange<'_>, opcode: OpCode) -> Result<()
     }
 }
 
+/// Receive the message that closes a session establishment this node initiated
+/// (the final message of CASE and of PASE) and require it to be a
+/// `StatusReport(SUCCESS, SESSION_ESTABLISHMENT_SUCCESS)`.
+///
+/// Fails with `InvalidOpcode` if the message is not a `StatusReport` at all,
+/// and with `Invalid` if it reports anything but success.
+async fn expect_session_establishment_success(exchange: &mut Exchange<'_>) -> Result<(), Error> {
+    exchange.recv_fetch().await?;
+
+    let rx = exchange.rx()?;
+    let meta = rx.meta();
+
+    if meta.proto_opcode != OpCode::StatusReport as u8 {
+        error!(
+            "Unexpected opcode: expected StatusReport, got {}",
+            meta.proto_opcode
+        );
+        return Err(ErrorCode::InvalidOpcode.into());
+    }
+
+    let mut rb = ReadBuf::new(rx.payload());
+    let status = StatusReport::read(&mut rb)?;
+
+    if status.general_code != GeneralCode::Success
+        || status.proto_code != SCStatusCodes::SessionEstablishmentSuccess as u16
+    {
+        error!(
+            "Session establishment failed: general={:?}, proto_code={}",
+            status.general_code, status.proto_code
+        );
+        return Err(ErrorCode::Invalid.into());
+    }
+
+    Ok(())
+}
+
 /// Check that the opcode of the received message matches the expected one.
 /// Logs an error if that's not the case, and if the opcode is `StatusReport`,
 /// it also logs the details of the status report.
