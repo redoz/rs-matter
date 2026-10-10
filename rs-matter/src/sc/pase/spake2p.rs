@@ -91,6 +91,46 @@ canon!(
     Spake2pSessionKeysRef
 );
 
+/// Computes the canonical SPAKE2+ verifier used by an enhanced commissioning window.
+pub struct Spake2pVerifier;
+
+impl Spake2pVerifier {
+    /// Derive `w0 || L` from a Matter passcode, PBKDF salt and iteration count.
+    ///
+    /// The result retains the crypto material's redacted debug output and zero-on-drop
+    /// behavior. This is the same derivation used by the PASE responder's password path.
+    pub fn compute<C: Crypto>(
+        crypto: C,
+        passcode: u32,
+        salt: &[u8],
+        iterations: u32,
+    ) -> Result<Spake2pVerifierStr, Error> {
+        let password = Spake2pVerifierPassword::from(passcode.to_le_bytes());
+        let mut w0s_w1s = Spake2pW::new();
+        Spake2P::compute_w0s_w1s(
+            &crypto,
+            password.reference(),
+            iterations,
+            salt,
+            &mut w0s_w1s,
+        )?;
+        let (w0s, w1s) = w0s_w1s
+            .reference()
+            .split::<UINT320_CANON_LEN, UINT320_CANON_LEN>();
+        let w0 = crypto.ec_scalar_mod_p(w0s)?;
+        let w1 = crypto.ec_scalar_mod_p(w1s)?;
+        let l_pt = crypto.ec_generator_point()?.mul(&w1)?;
+        let mut scalar = CanonEcScalar::new();
+        let mut point = CanonEcPoint::new();
+        w0.write_canon(&mut scalar)?;
+        l_pt.write_canon(&mut point)?;
+        let mut verifier = Spake2pVerifierStr::new();
+        verifier.access_mut()[..EC_CANON_SCALAR_LEN].copy_from_slice(scalar.access());
+        verifier.access_mut()[EC_CANON_SCALAR_LEN..].copy_from_slice(point.access());
+        Ok(verifier)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Spake2pVerifierData {
@@ -285,35 +325,24 @@ impl Spake2P {
             Err(ErrorCode::InvalidData)?;
         }
 
-        let (w0, l_pt) = if let Some(pw) = verifier.password.as_ref().map(|pw| pw.reference()) {
-            // Derive w0 and L from the password
-            let mut w0s_w1s = Spake2pW::new();
-            Self::compute_w0s_w1s(
-                &crypto,
-                pw,
-                verifier.count,
-                verifier.salt_bytes(),
-                &mut w0s_w1s,
-            )?;
-
-            let (w0s, w1s) = w0s_w1s
-                .reference()
-                .split::<UINT320_CANON_LEN, UINT320_CANON_LEN>();
-
-            let w0 = crypto.ec_scalar_mod_p(w0s)?;
-            let w1 = crypto.ec_scalar_mod_p(w1s)?;
-            let l_pt = crypto.ec_generator_point()?.mul(&w1)?;
-
-            (w0, l_pt)
-        } else {
-            // Extract w0 and L from the verifier
-            let (w0, l_pt) = verifier
-                .verifier
-                .reference()
-                .split::<EC_CANON_SCALAR_LEN, EC_CANON_POINT_LEN>();
-
-            (crypto.ec_scalar(w0)?, crypto.ec_point(l_pt)?)
-        };
+        let computed = verifier
+            .password
+            .as_ref()
+            .map(|password| {
+                Spake2pVerifier::compute(
+                    &crypto,
+                    u32::from_le_bytes(*password.access()),
+                    verifier.salt_bytes(),
+                    verifier.count,
+                )
+            })
+            .transpose()?;
+        let material = computed.as_ref().unwrap_or(&verifier.verifier);
+        let (w0, l_pt) = material
+            .reference()
+            .split::<EC_CANON_SCALAR_LEN, EC_CANON_POINT_LEN>();
+        let w0 = crypto.ec_scalar(w0)?;
+        let l_pt = crypto.ec_point(l_pt)?;
 
         let n_pt = crypto.ec_point(Self::MATTER_N_BIN)?;
         let (b_pt, xy) = Self::compute_b_pt_xy(&crypto, &n_pt, &w0)?;
@@ -943,6 +972,15 @@ mod tests {
 
     #[test]
     fn test_prover_verifier_roundtrip() {
+        prover_verifier_roundtrip(false);
+    }
+
+    #[test]
+    fn test_computed_verifier_roundtrip() {
+        prover_verifier_roundtrip(true);
+    }
+
+    fn prover_verifier_roundtrip(precomputed: bool) {
         // Test that prover and verifier derive the same session key
 
         // Test parameters
@@ -983,8 +1021,12 @@ mod tests {
         // Step 2: Verifier receives X, generates Y and cB
         // Create verifier data directly with password
         let mut verifier_data = Spake2pVerifierData {
-            password: Some(password_ref.into()),
-            verifier: Spake2pVerifierStr::new(),
+            password: (!precomputed).then(|| password_ref.into()),
+            verifier: if precomputed {
+                Spake2pVerifier::compute(test_only_crypto(), password, &salt, iterations).unwrap()
+            } else {
+                Spake2pVerifierStr::new()
+            },
             salt: Spake2pVerifierSalt::new(),
             salt_len: SPAKE2P_VERIFIER_SALT_LEN as u8,
             count: iterations,
