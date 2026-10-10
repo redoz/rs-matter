@@ -118,6 +118,9 @@ pub enum ErrorCode {
     NocLabelConflict,
     NocInvalidFabricIndex,
     NocInvalidAdminSubject,
+    /// A device answered an `AddNOC` / `UpdateNOC` with `InvalidNodeOpId`:
+    /// the NOC's node id is not a valid operational node id.
+    NocInvalidNodeOpId,
     Failure,
     // Certification Declaration errors
     CdInvalidFormat,

@@ -63,7 +63,7 @@ use core::num::NonZeroU8;
 use crate::cert::gen::Validity;
 use crate::crypto::{Crypto, Rng, AEAD_CANON_KEY_LEN};
 use crate::dm::clusters::gen_comm::{CommissioningErrorEnum, GeneralCommissioningClient};
-use crate::dm::clusters::noc::{NodeOperationalCertStatusEnum, OperationalCredentialsClient};
+use crate::dm::clusters::noc::OperationalCredentialsClient;
 use crate::dm::endpoints::ROOT_ENDPOINT_ID;
 use crate::dm::NodeId;
 use crate::error::{Error, ErrorCode};
@@ -580,9 +580,10 @@ impl<'a, 'b, C: Crypto> Commissioner<'a, 'b, C> {
 
         handle.complete().await?;
 
-        if status != NodeOperationalCertStatusEnum::OK {
-            return Err(ErrorCode::Failure.into());
-        }
+        // A refused `AddNOC` is named (`NocFabricConflict`, `NocFabricTableFull`,
+        // ...): the device already holding this fabric and the device being
+        // out of fabric slots call for different remedies.
+        status.result()?;
 
         // Spec reserves `fabric_index=0` for PASE / no-fabric; the
         // device must assign a non-zero slot on a successful `AddNOC`.
