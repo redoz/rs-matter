@@ -254,6 +254,29 @@ impl<'a> StatusReport<'a> {
 
         Ok(())
     }
+
+    /// The error a session-establishment initiator fails with when the peer
+    /// answers with this (non-success) status report.
+    ///
+    /// The two Secure Channel refusals a caller can act on are named:
+    /// `NoSharedTrustRoots` (the responder holds no fabric matching our
+    /// destination identifier - it does not, or no longer, trusts us) becomes
+    /// `ErrorCode::NoSharedTrustRoots`, and `Busy` (the responder is out of
+    /// resources for now and may be retried) becomes `ErrorCode::Busy`.
+    /// Anything else stays the generic `ErrorCode::Invalid`.
+    pub fn establishment_error(&self) -> Error {
+        let secure_channel = self.proto_id == PROTO_ID_SECURE_CHANNEL as u32;
+
+        if secure_channel && self.proto_code == SCStatusCodes::NoSharedTrustRoots as u16 {
+            ErrorCode::NoSharedTrustRoots.into()
+        } else if self.general_code == GeneralCode::Busy
+            || (secure_channel && self.proto_code == SCStatusCodes::Busy as u16)
+        {
+            ErrorCode::Busy.into()
+        } else {
+            ErrorCode::Invalid.into()
+        }
+    }
 }
 
 /// An extension point for the [`SecureChannel`] handler, letting a controller
@@ -401,6 +424,75 @@ async fn expect_opcode(exchange: &mut Exchange<'_>, opcode: OpCode) -> Result<()
     }
 }
 
+/// Fail the step of a session establishment this node initiated if the
+/// message it just received is a `StatusReport`: the responder refused, and
+/// the refusal is named by [`StatusReport::establishment_error`]. `step`
+/// names the step in the log. `Ok` for any other message, which the caller
+/// then checks for the opcode it expects.
+///
+/// Every initiator step that can be answered with a refusal goes through
+/// here (CASE Sigma1, PASE PBKDFParamRequest and Pake1), so a responder's
+/// `Busy` or `NoSharedTrustRoots` reads the same whichever step it answered.
+fn fail_on_status_report(exchange: &Exchange<'_>, step: &str) -> Result<(), Error> {
+    let rx = exchange.rx()?;
+
+    status_report_refusal(rx.meta().proto_opcode, rx.payload(), step)
+}
+
+/// [`fail_on_status_report`] over the received message's protocol opcode
+/// and payload.
+fn status_report_refusal(proto_opcode: u8, payload: &[u8], step: &str) -> Result<(), Error> {
+    if proto_opcode != OpCode::StatusReport as u8 {
+        return Ok(());
+    }
+
+    let mut rb = ReadBuf::new(payload);
+    let status = StatusReport::read(&mut rb)?;
+    error!(
+        "{} refused: general={:?}, proto_code={}",
+        step, status.general_code, status.proto_code
+    );
+
+    Err(status.establishment_error())
+}
+
+/// Receive the message that closes a session establishment this node initiated
+/// (the final message of CASE and of PASE) and require it to be a
+/// `StatusReport(SUCCESS, SESSION_ESTABLISHMENT_SUCCESS)`.
+///
+/// Fails with `InvalidOpcode` if the message is not a `StatusReport` at all,
+/// and with [`StatusReport::establishment_error`] if it reports anything but
+/// success.
+async fn expect_session_establishment_success(exchange: &mut Exchange<'_>) -> Result<(), Error> {
+    exchange.recv_fetch().await?;
+
+    let rx = exchange.rx()?;
+    let meta = rx.meta();
+
+    if meta.proto_opcode != OpCode::StatusReport as u8 {
+        error!(
+            "Unexpected opcode: expected StatusReport, got {}",
+            meta.proto_opcode
+        );
+        return Err(ErrorCode::InvalidOpcode.into());
+    }
+
+    let mut rb = ReadBuf::new(rx.payload());
+    let status = StatusReport::read(&mut rb)?;
+
+    if status.general_code != GeneralCode::Success
+        || status.proto_code != SCStatusCodes::SessionEstablishmentSuccess as u16
+    {
+        error!(
+            "Session establishment failed: general={:?}, proto_code={}",
+            status.general_code, status.proto_code
+        );
+        return Err(status.establishment_error());
+    }
+
+    Ok(())
+}
+
 /// Check that the opcode of the received message matches the expected one.
 /// Logs an error if that's not the case, and if the opcode is `StatusReport`,
 /// it also logs the details of the status report.
@@ -440,7 +532,79 @@ mod tests {
     use crate::transport::mrp::MRP_BASE_RETRY_INTERVAL_MS;
     use crate::Matter;
 
-    use super::SessionParameters;
+    use super::{GeneralCode, SCStatusCodes, SessionParameters, StatusReport};
+    use crate::error::ErrorCode;
+
+    /// Every initiator step's refusal check (CASE Sigma1, PASE
+    /// PBKDFParamRequest and Pake1) names a `StatusReport` the same way, and
+    /// lets any other message through to the step's own opcode check.
+    #[test]
+    fn a_status_report_at_any_initiator_step_is_named() {
+        use super::{status_report_refusal, OpCode, WriteBuf};
+
+        let report = |code: SCStatusCodes, payload: &[u8]| {
+            let mut buf = [0u8; 32];
+            let mut wb = WriteBuf::new(&mut buf);
+            code.as_report(payload).write(&mut wb).unwrap();
+            wb.as_slice().to_vec()
+        };
+        let status = OpCode::StatusReport as u8;
+
+        let busy = report(SCStatusCodes::Busy, &[0xe8, 0x03]);
+        for step in ["CASE Sigma1", "PASE PBKDFParamRequest", "PASE Pake1"] {
+            let err = status_report_refusal(status, &busy, step).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Busy, "{step}");
+        }
+        let refused = report(SCStatusCodes::NoSharedTrustRoots, &[]);
+        assert_eq!(
+            status_report_refusal(status, &refused, "CASE Sigma1")
+                .unwrap_err()
+                .code(),
+            ErrorCode::NoSharedTrustRoots
+        );
+        // Not a StatusReport: the step's own opcode check decides.
+        assert!(status_report_refusal(OpCode::PASEPake2 as u8, &busy, "PASE Pake1").is_ok());
+    }
+
+    /// A refusal the initiator can act on is named; anything else stays
+    /// `Invalid`.
+    #[test]
+    fn establishment_error_names_no_shared_trust_roots_and_busy() {
+        let code = |status: StatusReport<'_>| status.establishment_error().code();
+
+        assert_eq!(
+            code(SCStatusCodes::NoSharedTrustRoots.as_report(&[])),
+            ErrorCode::NoSharedTrustRoots
+        );
+        // `Busy` carries the minimum wait time as protocol data.
+        assert_eq!(
+            code(SCStatusCodes::Busy.as_report(&[0xe8, 0x03])),
+            ErrorCode::Busy
+        );
+        assert_eq!(
+            code(SCStatusCodes::InvalidParameter.as_report(&[])),
+            ErrorCode::Invalid
+        );
+        assert_eq!(
+            code(StatusReport {
+                general_code: GeneralCode::Failure,
+                proto_id: super::PROTO_ID_SECURE_CHANNEL as u32,
+                proto_code: 0xffff,
+                proto_data: &[],
+            }),
+            ErrorCode::Invalid
+        );
+        // Another protocol's code 1 is not a Secure Channel refusal.
+        assert_eq!(
+            code(StatusReport {
+                general_code: GeneralCode::Failure,
+                proto_id: 0x0001,
+                proto_code: SCStatusCodes::NoSharedTrustRoots as u16,
+                proto_data: &[],
+            }),
+            ErrorCode::Invalid
+        );
+    }
 
     /// The session parameters a node sends always carry the fields the spec
     /// requires: the revisions, the max paths per invoke and - because those

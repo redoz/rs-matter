@@ -64,6 +64,11 @@ pub enum ErrorCode {
     NoNodeId,
     NoMemory,
     NoSession,
+    /// A CASE responder found no fabric matching the initiator's destination
+    /// identifier and answered `StatusReport(Failure, NoSharedTrustRoots)`:
+    /// the peer does not (or no longer) hold the fabric this node tried to
+    /// establish a session on.
+    NoSharedTrustRoots,
     // TODO: Rename to `TLVNoWriteSpace` or similar, so that it is clear
     // that this error code should _only_ be used when writing a TLV using
     // a `TLVWrite` instance which happens to run out of space
@@ -118,6 +123,9 @@ pub enum ErrorCode {
     NocLabelConflict,
     NocInvalidFabricIndex,
     NocInvalidAdminSubject,
+    /// A device answered an `AddNOC` / `UpdateNOC` with `InvalidNodeOpId`:
+    /// the NOC's node id is not a valid operational node id.
+    NocInvalidNodeOpId,
     Failure,
     // Certification Declaration errors
     CdInvalidFormat,
