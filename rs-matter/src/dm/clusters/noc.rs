@@ -65,6 +65,28 @@ impl NodeOperationalCertStatusEnum {
             },
         }
     }
+
+    /// The outcome a commissioner reads from a device's `NOCResponse`
+    /// status (to `AddNOC` / `UpdateNOC`): `Ok` for `OK`, else the named
+    /// `ErrorCode` the device's own handler maps to this status (the
+    /// inverse of the responder's mapping), so a caller can tell a fabric
+    /// conflict from a full table or a bad certificate.
+    pub fn result(self) -> Result<(), Error> {
+        let code = match self {
+            Self::OK => return Ok(()),
+            Self::InvalidPublicKey => ErrorCode::NocInvalidPublicKey,
+            Self::InvalidNodeOpId => ErrorCode::NocInvalidNodeOpId,
+            Self::InvalidNOC => ErrorCode::NocInvalidNoc,
+            Self::MissingCsr => ErrorCode::NocMissingCsr,
+            Self::TableFull => ErrorCode::NocFabricTableFull,
+            Self::InvalidAdminSubject => ErrorCode::NocInvalidAdminSubject,
+            Self::FabricConflict => ErrorCode::NocFabricConflict,
+            Self::LabelConflict => ErrorCode::NocLabelConflict,
+            Self::InvalidFabricIndex => ErrorCode::NocInvalidFabricIndex,
+        };
+
+        Err(code.into())
+    }
 }
 
 /// The system implementation of a handler for the Node Operational Credentials Matter cluster.
@@ -1052,3 +1074,39 @@ const FABRIC_BINDING_VERSION_1: u8 = 1;
 /// `ClientChallenge` is fixed at 32 octets (cluster XML
 /// `length="32" minLength="32"` on `SignVIDVerificationRequest`).
 const VID_VERIFY_CLIENT_CHALLENGE_LEN: usize = 32;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::NodeOperationalCertStatusEnum as Status;
+    use crate::error::{Error, ErrorCode};
+
+    /// Every status a device can answer `AddNOC` with reaches the commissioner
+    /// named, and the names are the ones the device's own handler maps from,
+    /// so a status survives the round trip.
+    #[test]
+    fn a_noc_response_status_is_named_for_the_commissioner() {
+        assert!(Status::OK.result().is_ok());
+        assert_eq!(
+            Status::FabricConflict.result().unwrap_err().code(),
+            ErrorCode::NocFabricConflict
+        );
+        assert_eq!(
+            Status::InvalidNodeOpId.result().unwrap_err().code(),
+            ErrorCode::NocInvalidNodeOpId
+        );
+        for status in [
+            Status::InvalidPublicKey,
+            Status::InvalidNOC,
+            Status::MissingCsr,
+            Status::TableFull,
+            Status::InvalidAdminSubject,
+            Status::FabricConflict,
+            Status::LabelConflict,
+            Status::InvalidFabricIndex,
+        ] {
+            let error: Error = status.result().unwrap_err();
+            assert_eq!(Status::map(Err(error)).unwrap(), status, "{status:?}");
+        }
+    }
+}
