@@ -32,7 +32,7 @@ use rs_matter::crypto::{
     SigningSecretKey, AEAD_CANON_KEY_LEN,
 };
 use rs_matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM};
-use rs_matter::error::Error;
+use rs_matter::error::{Error, ErrorCode};
 use rs_matter::onboard::cac::RcacGenerator;
 use rs_matter::onboard::noc::NocGenerator;
 use rs_matter::respond::Responder;
@@ -132,7 +132,7 @@ fn is_sigma2(data: &[u8]) -> bool {
 /// not advertise is inherited from that hint.
 #[test]
 fn test_case_handshake() {
-    run_case_handshake_test(false, 1);
+    run_case_handshake_test(false, 1, true);
 }
 
 /// Test that retransmitting Sigma2 produces the same packet and still completes CASE.
@@ -141,16 +141,28 @@ fn test_case_handshake() {
 /// Dropping the responder's first Sigma2 forces that path.
 #[test]
 fn test_case_handshake_with_sigma2_retransmission() {
-    run_case_handshake_test(true, 1);
+    run_case_handshake_test(true, 1, true);
 }
 
 /// Test that one-shot CASE sessions do not cause BUSY when they fill the session table of the device.
 #[test]
 fn test_case_one_shot_sessions_on_full_session_table() {
-    run_case_handshake_test(false, MAX_SESSIONS);
+    run_case_handshake_test(false, MAX_SESSIONS, true);
 }
 
-fn run_case_handshake_test(drop_first_sigma2: bool, handshakes: usize) {
+/// Test that a responder which does not hold the initiator's fabric - one that
+/// never joined it, or had it removed by another administrator - refuses
+/// Sigma1 with `NoSharedTrustRoots`, and that the initiator surfaces that
+/// refusal as `ErrorCode::NoSharedTrustRoots` rather than a generic `Invalid`.
+#[test]
+fn test_case_handshake_without_a_shared_fabric_is_no_shared_trust_roots() {
+    run_case_handshake_test(false, 1, false);
+}
+
+/// Runs `handshakes` CASE handshakes from a controller to a device. With
+/// `device_has_fabric` false the device's fabric table is left empty, so the
+/// (first) handshake must fail with `NoSharedTrustRoots`.
+fn run_case_handshake_test(drop_first_sigma2: bool, handshakes: usize, device_has_fabric: bool) {
     init_env_logger();
 
     futures_lite::future::block_on(async {
@@ -239,21 +251,23 @@ fn run_case_handshake_test(drop_first_sigma2: bool, handshakes: usize) {
             .generate(&crypto, device_csr, DEVICE_NODE_ID, &[], VALID_FOREVER)
             .unwrap();
 
-        device_matter.with_state(|state| {
-            state
-                .fabrics
-                .add(
-                    &crypto,
-                    device_secret_key_canon.reference(),
-                    rcac,
-                    device_noc,
-                    &[], // no ICAC
-                    Some(ipk_ref),
-                    0xFFF1,
-                    CONTROLLER_NODE_ID,
-                )
-                .unwrap();
-        });
+        if device_has_fabric {
+            device_matter.with_state(|state| {
+                state
+                    .fabrics
+                    .add(
+                        &crypto,
+                        device_secret_key_canon.reference(),
+                        rcac,
+                        device_noc,
+                        &[], // no ICAC
+                        Some(ipk_ref),
+                        0xFFF1,
+                        CONTROLLER_NODE_ID,
+                    )
+                    .unwrap();
+            });
+        }
 
         // ---- 4. Bind UDP sockets ----
 
@@ -331,6 +345,12 @@ fn run_case_handshake_test(drop_first_sigma2: bool, handshakes: usize) {
         // ---- 7. Run device and controller concurrently ----
 
         let result = run_device_controller(device_fut, controller_fut).await;
+
+        if !device_has_fabric {
+            let err = result.expect_err("a device without our fabric must refuse CASE");
+            assert_eq!(err.code(), ErrorCode::NoSharedTrustRoots);
+            return;
+        }
 
         if drop_first_sigma2 {
             let packets = first_two_packets.lock().unwrap();
