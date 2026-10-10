@@ -29,8 +29,7 @@ use crate::dm::endpoints::ROOT_ENDPOINT_ID;
 use crate::error::{Error, ErrorCode};
 use crate::im::{ClusterId, EndptId};
 use crate::sc::pase::spake2p::{
-    Spake2pVerifierData, Spake2pVerifierStrRef, SPAKE2P_VERIFIER_SALT_LEN,
-    SPAKE2P_VERIFIER_SALT_MIN_LEN,
+    Spake2pVerifierData, SPAKE2P_VERIFIER_SALT_LEN, SPAKE2P_VERIFIER_SALT_MIN_LEN,
 };
 use crate::sc::SessionParameters;
 use crate::tlv::{FromTLV, OctetStr, ToTLV};
@@ -42,8 +41,8 @@ use crate::MatterLocalService;
 pub use initiator::PaseInitiator;
 pub use responder::PaseResponder;
 pub use spake2p::{
-    Spake2pVerifierPassword, Spake2pVerifierPasswordRef, SPAKE2P_VERIFIER_PASSWORD_LEN,
-    SPAKE2P_VERIFIER_PASSWORD_ZEROED,
+    Spake2pVerifier, Spake2pVerifierPassword, Spake2pVerifierPasswordRef, Spake2pVerifierStr,
+    Spake2pVerifierStrRef, SPAKE2P_VERIFIER_PASSWORD_LEN, SPAKE2P_VERIFIER_PASSWORD_ZEROED,
 };
 
 mod initiator;
