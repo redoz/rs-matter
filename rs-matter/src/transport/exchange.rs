@@ -128,18 +128,9 @@ impl ExchangeId {
                 if packet.buf.is_empty() {
                     false
                 } else {
-                    let for_us = self.with_state(matter, |state| {
-                        let sess = self.session(&mut state.sessions);
-                        if sess.is_for_rx(&packet.peer, &packet.header.plain) {
-                            let exch = self.exch(sess);
-
-                            return Ok(exch.is_for_rx(&packet.header.proto));
-                        }
-
-                        Ok(false)
-                    });
-
-                    for_us.unwrap_or(true)
+                    packet.rx_exchange == Some(*self)
+                        && matter
+                            .with_state(|state| packet.rx_session(&mut state.sessions).is_some())
                 }
             }));
 
@@ -588,6 +579,11 @@ impl MessageMeta {
     pub(crate) fn is_sc_status(&self) -> bool {
         self.proto_id == PROTO_ID_SECURE_CHANNEL
             && self.proto_opcode == sc::OpCode::StatusReport as u8
+    }
+
+    /// Whether this is a Secure Channel Check-In notification.
+    pub(crate) fn is_check_in(&self) -> bool {
+        self.proto_id == PROTO_ID_SECURE_CHANNEL && self.proto_opcode == sc::OpCode::CheckIn as u8
     }
 
     /// Utility method to check if the protocol is Secure Channel, and the opcode is a new session request.
@@ -1638,17 +1634,19 @@ impl Drop for Exchange<'_> {
 
             let closed = sess.remove_exch(exch_index);
             if closed {
-                // RX group sessions (unicast peer = the sender's address) are
+                // Check-In notification sessions and RX group sessions
+                // (unicast peer = the sender's address) are
                 // ephemeral, one per received message — remove them with their
                 // last exchange. TX group sessions (multicast peer) stay: the
                 // just-queued outgoing packet still needs the session for
                 // encoding, and subsequent sends to the same group reuse it
                 // (`get_or_create_for_group_tx`); LRU eviction reclaims them.
-                if matches!(sess.get_session_mode(), SessionMode::Group { .. })
+                if (sess.ephemeral
+                    || matches!(sess.get_session_mode(), SessionMode::Group { .. })
+                        && !sess.is_peer_multicast())
                     && sess.exchanges.iter().all(Option::is_none)
-                    && !sess.is_peer_multicast()
                 {
-                    // Group session with no remaining exchanges — remove it
+                    // Ephemeral RX session with no remaining exchanges — remove it
                     state.sessions.remove(self.id.session_id());
                     self.matter.transport().notify_session_removed();
                 }
