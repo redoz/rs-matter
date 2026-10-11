@@ -741,10 +741,7 @@ impl Transport {
             .rx
             .with(|packet| {
                 matter.with_state(|state| {
-                    let session = state
-                        .sessions
-                        .get_for_rx(&packet.peer, &packet.header.plain)?;
-                    let exch_index = session.get_exch_for_rx(&packet.header.proto)?;
+                    let (session, exch_index) = packet.rx_session(&mut state.sessions)?;
 
                     let matches = {
                         // `unwrap` is safe because the transport code is single threaded, and since we don't `await`
@@ -1568,11 +1565,10 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
 
             trace!("Waiting for accept timeout");
 
-            let mut accept_timeout = pin!(self
-                .matter
-                .transport
-                .rx
-                .with(|packet| { self.handle_accept_timeout_rx_packet(packet).then_some(()) }));
+            let mut accept_timeout = pin!(self.matter.transport.rx.with(|packet| {
+                self.handle_accept_timeout_rx_packet(packet, ACCEPT_TIMEOUT_MS)
+                    .then_some(())
+            }));
 
             let mut timer = pin!(Timer::after(embassy_time::Duration::from_millis(50)));
 
@@ -1774,6 +1770,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                     // makes two peers bounce reports at each other forever.
                     let meta = MessageMeta::from(&packet.header.proto);
                     if meta.is_sc_status()
+                        || meta.is_check_in()
                         || meta.is_standalone_ack()
                         || packet.header.plain.is_group_session()
                     {
@@ -1841,10 +1838,9 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                         );
 
                         self.matter.with_state(|state| {
-                            if let Some(session_id) = state
-                                .sessions
-                                .get_for_rx(&packet.peer, &packet.header.plain)
-                                .map(|sess| sess.id)
+                            if let Some(session_id) = packet
+                                .rx_session(&mut state.sessions)
+                                .map(|(sess, _)| sess.id)
                             {
                                 state.sessions.remove(session_id);
                                 self.transport().notify_session_removed();
@@ -1892,20 +1888,17 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
         Ok(false)
     }
 
-    fn handle_accept_timeout_rx_packet<const N: usize>(&self, packet: &mut Packet<N>) -> bool {
+    fn handle_accept_timeout_rx_packet<const N: usize>(
+        &self,
+        packet: &mut Packet<N>,
+        timeout_ms: u64,
+    ) -> bool {
         if packet.buf.is_empty() {
             return false;
         }
 
         self.matter.with_state(|state| {
-            let Some(session) = state
-                .sessions
-                .get_for_rx(&packet.peer, &packet.header.plain)
-            else {
-                return false;
-            };
-
-            let Some(exch_index) = session.get_exch_for_rx(&packet.header.proto) else {
+            let Some((session, exch_index)) = packet.rx_session(&mut state.sessions) else {
                 return false;
             };
 
@@ -1915,7 +1908,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
             if !matches!(
                 exchange.role,
                 Role::Responder(ResponderState::AcceptPending)
-            ) || !exchange.mrp.has_rx_timed_out(ACCEPT_TIMEOUT_MS)
+            ) || !exchange.mrp.has_rx_timed_out(timeout_ms)
             {
                 return false;
             }
@@ -1939,19 +1932,8 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
         }
 
         self.matter.with_state(|state| {
-            let Some(session) = state
-                .sessions
-                .get_for_rx(&packet.peer, &packet.header.plain)
-            else {
-                mrp_log!("\n>>RCV {}\n => No session, dropping", packet);
-
-                packet.buf.clear();
-                return true;
-            };
-
-            let Some(exch_index) = session.get_exch_for_rx(&packet.header.proto) else {
-                mrp_log!("\n>>RCV {}\n => No exchange, dropping", packet);
-
+            let Some((session, exch_index)) = packet.rx_session(&mut state.sessions) else {
+                mrp_log!("\n>>RCV {}\n => No owning exchange, dropping", packet);
                 packet.buf.clear();
                 return true;
             };
@@ -2029,6 +2011,10 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
 
                 warn!("Dropped exchange {}: Closed", exchange_id.display(session));
                 session.exchanges[exch_index] = None;
+                if session.ephemeral && session.exchanges.iter().all(Option::is_none) {
+                    state.sessions.remove(session_id);
+                    self.transport().notify_session_removed();
+                }
             }
 
             Ok(exch.is_none())
@@ -2058,6 +2044,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
     fn decode_packet<const N: usize>(&self, packet: &mut Packet<N>) -> Result<bool, Error> {
         self.matter.with_state(|state| {
             packet.header.reset();
+            packet.rx_exchange = None;
 
             let mut pb = ParseBuf::new(&mut packet.buf[packet.payload_start..]);
             packet.header.plain.decode(&mut pb)?;
@@ -2067,17 +2054,20 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 packet.buf.truncate(end);
             };
 
-            if let Some(session) = state
-                .sessions
-                .get_for_rx(&packet.peer, &packet.header.plain)
-            {
+            if let Some(session) = if packet.header.plain.is_encrypted() {
+                state
+                    .sessions
+                    .get_for_rx(&packet.peer, &packet.header.plain)
+            } else {
+                None
+            } {
                 // Found existing session: decode, indicate packet payload slice and process further
 
                 let payload_range =
                     session.decode_remaining(&self.crypto, &mut packet.header, pb)?;
                 set_payload(packet, payload_range);
 
-                return session.post_recv(&packet.peer, &packet.header);
+                return packet.post_recv(session);
             }
 
             // No existing session: we either have to create one, or return an error
@@ -2093,7 +2083,37 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 let payload_range = pb.slice_range();
                 set_payload(packet, payload_range);
 
-                if MessageMeta::from(&packet.header.proto).is_new_session() {
+                let meta = MessageMeta::from(&packet.header.proto);
+                if meta.is_check_in() {
+                    // Check-In carries its own authenticated payload and expects no
+                    // reply. Give it a per-message exchange, never a handshake session.
+                    // Invalid framing must not allocate a session or schedule an ACK.
+                    if !packet.header.proto.is_initiator() || packet.header.proto.is_reliable() {
+                        return Err(ErrorCode::NoExchange.into());
+                    }
+                    let session = state.sessions.add(
+                        self.crypto.rand()?.next_u32(),
+                        false,
+                        packet.peer,
+                        packet.header.plain.get_src_nodeid(),
+                    )?;
+                    session.ephemeral = true;
+                    let id = session.id();
+                    let result = packet.post_recv(session);
+                    if result.is_err() {
+                        state.sessions.remove(id);
+                    }
+                    return result;
+                }
+
+                if let Some(session) = state
+                    .sessions
+                    .get_for_rx(&packet.peer, &packet.header.plain)
+                {
+                    return packet.post_recv(session);
+                }
+
+                if meta.is_new_session() {
                     // As per spec, new unencrypted sessions are only created for
                     // `PBKDFParamRequest` or `CASESigma1` unencrypted messages
 
@@ -2107,7 +2127,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                     )?;
 
                     // Session created successfully: decode, indicate packet payload slice and process further
-                    return session.post_recv(&packet.peer, &packet.header);
+                    return packet.post_recv(session);
                 }
 
                 // A `SessionNotFound` is the peer telling us that a session *we*
@@ -2158,7 +2178,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
 
                     set_payload(packet, payload_range);
 
-                    return session.post_recv(&packet.peer, &packet.header);
+                    return packet.post_recv(session);
                 }
 
                 // Encrypted unicast packet with no matching session — cannot be decoded
@@ -2471,6 +2491,8 @@ pub(crate) struct Packet<const N: usize> {
     pub(crate) buf: PacketBuffer<N>,
     pub(crate) payload_start: usize,
     pub(crate) tx_info: TxInfo,
+    /// Exact internal owner selected by successful receive admission. Never serialized.
+    pub(crate) rx_exchange: Option<ExchangeId>,
 }
 
 impl<const N: usize> Packet<N> {
@@ -2482,6 +2504,7 @@ impl<const N: usize> Packet<N> {
             buf: PacketBuffer::new(),
             payload_start: 0,
             tx_info: TxInfo::new(),
+            rx_exchange: None,
         }
     }
 
@@ -2492,7 +2515,32 @@ impl<const N: usize> Packet<N> {
             buf <- PacketBuffer::init(),
             payload_start: 0,
             tx_info: TxInfo::new(),
+            rx_exchange: None,
         })
+    }
+
+    fn post_recv(&mut self, session: &mut Session) -> Result<bool, Error> {
+        let new_exchange = session.post_recv(&self.peer, &self.header)?;
+        // Successful post_recv either found or created the exchange.
+        let index = unwrap!(session.get_exch_for_rx(&self.header.proto));
+        self.rx_exchange = Some(ExchangeId::new(session.id(), index));
+        Ok(new_exchange)
+    }
+
+    fn rx_session<'a>(&self, sessions: &'a mut Sessions) -> Option<(&'a mut Session, usize)> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let id = self.rx_exchange?;
+        let session = sessions.get(id.session_id())?;
+        let index = id.exchange_index();
+        session.exchanges.get(index)?.as_ref()?;
+        // A canceled exchange's slot may have been reused while its packet
+        // still awaits orphan cleanup. Keep the original wire match as well.
+        if session.get_exch_for_rx(&self.header.proto) != Some(index) {
+            return None;
+        }
+        Some((session, index))
     }
 
     #[cfg(feature = "defmt")]
@@ -2713,6 +2761,7 @@ impl<const N: usize> Drop for PacketAccess<'_, N> {
     fn drop(&mut self) {
         if self.1 {
             self.buf.clear();
+            self.rx_exchange = None;
         }
     }
 }
@@ -3233,5 +3282,218 @@ mod browse_tests {
                 0x2222,
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod checkin_tests {
+    use super::*;
+    use crate::crypto::test_only_crypto;
+    use crate::test::test_matter;
+    use futures_lite::future::{block_on, poll_once};
+
+    fn frame(packet: &mut Packet<MAX_RX_BUF_SIZE>, counter: u32, initiator: bool, reliable: bool) {
+        let mut bytes = [0u8; 128];
+        let mut wb = WriteBuf::new_with(&mut bytes, PacketHdr::HDR_RESERVE, PacketHdr::HDR_RESERVE);
+        wb.copy_from_slice(&[counter as u8]).unwrap();
+        let mut header = PacketHdr::new();
+        header.plain.ctr = counter;
+        header.plain.set_src_nodeid(Some(123));
+        header.proto.proto_id = PROTO_ID_SECURE_CHANNEL;
+        header.proto.proto_opcode = OpCode::CheckIn as u8;
+        header.proto.exch_id = 7;
+        if initiator {
+            header.proto.set_initiator();
+        }
+        if reliable {
+            header.proto.set_reliable();
+        }
+        header
+            .encode(&test_only_crypto(), None, 0, &mut wb)
+            .unwrap();
+        packet.buf.resize_default(wb.as_slice().len()).unwrap();
+        packet.buf.copy_from_slice(wb.as_slice());
+        packet.payload_start = 0;
+        packet.peer = Address::Udp("127.0.0.1:5540".parse().unwrap());
+    }
+
+    fn inject(matter: &Matter<'_>, counter: u32) {
+        let mut packet = matter.transport().rx.try_lock().unwrap();
+        frame(&mut packet, counter, true, false);
+        assert!(TransportRunner::new(matter, test_only_crypto())
+            .decode_packet(&mut packet)
+            .unwrap());
+    }
+
+    #[test]
+    fn live_handshake_cannot_consume_colliding_checkin() {
+        block_on(async {
+            let matter = test_matter();
+            let id = matter.with_state(|state| {
+                let sess = state
+                    .sessions
+                    .add(
+                        1,
+                        false,
+                        Address::Udp("127.0.0.1:5540".parse().unwrap()),
+                        Some(123),
+                    )
+                    .unwrap();
+                let index = sess
+                    .add_exch(7, Role::Responder(ResponderState::Owned))
+                    .unwrap();
+                ExchangeId::new(sess.id(), index)
+            });
+            let mut handshake = Exchange::new(id, &matter);
+            {
+                let mut waiting = pin!(handshake.recv());
+                assert!(poll_once(waiting.as_mut()).await.is_none());
+                inject(&matter, 1);
+                assert!(
+                    poll_once(waiting.as_mut()).await.is_none(),
+                    "live handshake stole Check-In"
+                );
+                let mut checkin = poll_once(matter.transport().accept_if(&matter, |_, _, _| true))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(checkin.id().session_id(), id.session_id());
+                assert_eq!(
+                    checkin.recv().await.unwrap().meta().proto_opcode,
+                    OpCode::CheckIn as u8
+                );
+                drop(checkin);
+                assert_eq!(matter.with_state(|state| state.sessions.iter().count()), 1);
+            }
+            drop(handshake);
+        });
+    }
+
+    #[test]
+    fn overlapping_checkins_have_distinct_packet_owners() {
+        block_on(async {
+            let matter = test_matter();
+            inject(&matter, 1);
+            let mut first = matter
+                .transport()
+                .accept_if(&matter, |_, _, _| true)
+                .await
+                .unwrap();
+            first.recv_fetch().await.unwrap();
+            first.rx_done().unwrap();
+            inject(&matter, 2);
+            {
+                let mut waiting = pin!(first.recv());
+                assert!(
+                    poll_once(waiting.as_mut()).await.is_none(),
+                    "older Check-In exchange stole fresh notification"
+                );
+            }
+            let second = poll_once(matter.transport().accept_if(&matter, |_, _, _| true))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first.id().session_id(), second.id().session_id());
+            // Cancel the new handler before it fetches its packet. Its exact
+            // orphan is released without affecting the retained older exchange.
+            drop(second);
+            let mut packet = matter.transport().rx.try_lock().unwrap();
+            assert!(TransportRunner::new(&matter, test_only_crypto())
+                .handle_orphaned_rx_packet(&mut packet));
+            drop(packet);
+            drop(first);
+            assert_eq!(matter.with_state(|state| state.sessions.iter().count()), 0);
+        });
+    }
+
+    struct NoReplies;
+    impl NetworkSend for NoReplies {
+        async fn send_to(&mut self, data: &[u8], _addr: Address) -> Result<(), Error> {
+            panic!("Check-In must not elicit a reply: {data:02x?}");
+        }
+    }
+
+    #[test]
+    fn invalid_checkin_framing_and_capacity_exhaustion_never_reply() {
+        block_on(async {
+            let matter = test_matter();
+            let runner = TransportRunner::new(&matter, test_only_crypto());
+            let send = IfMutex::new(NoReplies);
+            for (initiator, reliable) in [(false, false), (true, true)] {
+                let mut packet = Packet::new();
+                frame(&mut packet, 1, initiator, reliable);
+                assert!(!runner.handle_rx_packet(&mut packet, &send).await.unwrap());
+                assert_eq!(matter.with_state(|state| state.sessions.iter().count()), 0);
+            }
+            let ids = matter.with_state(|state| {
+                while state.sessions.add(1, false, Address::new(), None).is_ok() {}
+                state
+                    .sessions
+                    .iter()
+                    .map(Session::id)
+                    .collect::<std::vec::Vec<_>>()
+            });
+            let mut packet = Packet::new();
+            frame(&mut packet, 1, true, false);
+            assert!(!runner.handle_rx_packet(&mut packet, &send).await.unwrap());
+            assert_eq!(
+                matter.with_state(|state| state
+                    .sessions
+                    .iter()
+                    .map(Session::id)
+                    .collect::<std::vec::Vec<_>>()),
+                ids
+            );
+            assert!(packet.rx_exchange.is_none());
+        });
+    }
+
+    #[test]
+    fn unaccepted_checkin_timeout_reclaims_its_exact_session() {
+        let matter = test_matter();
+        let runner = TransportRunner::new(&matter, test_only_crypto());
+        inject(&matter, 1);
+        let mut packet = matter.transport().rx.try_lock().unwrap();
+        assert!(runner.handle_accept_timeout_rx_packet(&mut packet, 0));
+        assert!(packet.buf.is_empty());
+        drop(packet);
+        let mut tx = Packet::<MAX_TX_BUF_SIZE>::new();
+        assert!(!runner.handle_dropped_exchange(&mut tx).unwrap());
+        assert!(tx.buf.is_empty(), "timeout cleanup scheduled a reply");
+        assert_eq!(matter.with_state(|state| state.sessions.iter().count()), 0);
+    }
+
+    #[test]
+    fn retired_rx_owner_does_not_match_a_reused_exchange_slot() {
+        let matter = test_matter();
+        let mut packet = Packet::<MAX_RX_BUF_SIZE>::new();
+        packet.buf.resize_default(1).unwrap();
+        packet.header.plain.ctr = 1;
+        packet.header.proto.proto_id = PROTO_ID_SECURE_CHANNEL;
+        packet.header.proto.proto_opcode = OpCode::PBKDFParamRequest as u8;
+        packet.header.proto.exch_id = 7;
+        packet.header.proto.set_initiator();
+        matter.with_state(|state| {
+            let session = state.sessions.add(1, false, packet.peer, None).unwrap();
+            let index = session
+                .add_exch(7, Role::Responder(ResponderState::Owned))
+                .unwrap();
+            packet.post_recv(session).unwrap();
+            // add_exch appends until the table reaches capacity, then reuses
+            // empty slots. Fill it first so this cancellation really reuses one.
+            let mut wire_id = 100;
+            while session
+                .add_exch(wire_id, Role::Responder(ResponderState::Owned))
+                .is_some()
+            {
+                wire_id += 1;
+            }
+            assert!(session.remove_exch(index));
+            assert_eq!(
+                session.add_exch(8, Role::Responder(ResponderState::Owned)),
+                Some(index)
+            );
+            assert!(packet.rx_session(&mut state.sessions).is_none());
+        });
     }
 }
