@@ -198,6 +198,8 @@ pub struct Session {
     /// Furthermore, expired sessions are the prime candidates for eviction.
     expired: bool,
     reserved: bool,
+    /// A receive-only unsecured notification session, reclaimed with its exchange.
+    pub(crate) ephemeral: bool,
 }
 
 impl Session {
@@ -234,6 +236,7 @@ impl Session {
             peer_active_threshold_ms,
             peer_active_until: Instant::MIN,
             expired: false,
+            ephemeral: false,
         }
     }
 
@@ -270,6 +273,7 @@ impl Session {
             peer_active_threshold_ms,
             peer_active_until: Instant::MIN,
             expired: false,
+            ephemeral: false,
         })
     }
 
@@ -976,7 +980,10 @@ impl Session {
 
         if exchange.mrp.is_retrans_pending() {
             exchange.role.set_dropped_state();
-            error!("Exchange {}: A packet is still (re)transmitted! Marking as dropped, but session will be closed", exchange_id.display(self));
+            error!(
+                "Exchange {}: A packet is still (re)transmitted! Marking as dropped, but session will be closed",
+                exchange_id.display(self)
+            );
 
             false
         } else if exchange.mrp.is_ack_pending() {
@@ -2289,7 +2296,9 @@ impl Sessions {
         let mut session = self
             .sessions
             .iter_mut()
-            .find(|sess| sess.is_for_rx(rx_peer, rx_plain));
+            // Per-message notification sessions are identified by the admitted
+            // packet owner, never by a potentially repeated wire identity.
+            .find(|sess| !sess.ephemeral && sess.is_for_rx(rx_peer, rx_plain));
 
         if let Some(session) = session.as_mut() {
             session.update_last_used();
