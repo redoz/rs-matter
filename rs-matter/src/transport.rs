@@ -392,6 +392,10 @@ impl Transport {
             })
             .await;
 
+        // Placing the request inside `wait` wakes nobody: wake the responder,
+        // which may already be waiting for one in `wait_mdns_resolve_request`.
+        self.mdns_resolve.modify(|_| (true, ()));
+
         // 2. Ensure the slot is released if this future is dropped (or times out).
         let mut guard = MdnsResolveGuard {
             signal: &self.mdns_resolve,
@@ -701,6 +705,10 @@ impl Transport {
                 }
             })
             .await;
+
+        // Placing the request inside `wait` wakes nobody: wake the responder,
+        // which may already be waiting for one in `wait_mdns_browse_request`.
+        self.mdns_browse.modify(|_| (true, ()));
 
         MdnsBrowseGuard {
             signal: &self.mdns_browse,
@@ -3264,6 +3272,95 @@ mod browse_tests {
             found.as_slice(),
             &[1, 2, 3, 4, 5, 6].map(|node_id| node(0xAA, node_id))
         );
+    }
+
+    /// A responder already waiting when a browse is placed is woken for it,
+    /// even under a waker of its own (as when it runs in another task):
+    /// placing happens in a `wait` closure, which wakes nobody by itself, and
+    /// `browse` then sleeps on its window rather than on the rendezvous.
+    #[cfg(feature = "std")]
+    #[test]
+    fn browse_wakes_a_responder_that_is_already_waiting() {
+        use core::future::Future;
+        use core::pin::pin;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use core::task::{Context, Poll, Waker};
+        use std::sync::Arc;
+        use std::task::Wake;
+
+        struct Woken(AtomicBool);
+
+        impl Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let matter = test_matter();
+        let query = MdnsBrowseQuery::Operational {
+            compressed_fabric_id: Some(0xAA),
+        };
+
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let responder_waker = Waker::from(woken.clone());
+        let mut responder_cx = Context::from_waker(&responder_waker);
+        let mut responder = pin!(matter.transport().wait_mdns_browse_request());
+        assert!(responder.as_mut().poll(&mut responder_cx).is_pending());
+
+        let mut browser = pin!(matter.transport().browse(&query, 1_000, |_| ()));
+        let mut browser_cx = Context::from_waker(Waker::noop());
+        assert!(browser.as_mut().poll(&mut browser_cx).is_pending());
+
+        assert!(
+            woken.0.load(Ordering::SeqCst),
+            "placing the request did not wake the waiting responder"
+        );
+        assert!(matches!(
+            responder.as_mut().poll(&mut responder_cx),
+            Poll::Ready(q) if q == query
+        ));
+    }
+
+    /// The same for a resolve: `Exchange::initiate` waits on the rendezvous
+    /// after placing it, but from the same task as a responder that shares its
+    /// waker, re-registering that waker wakes nobody.
+    #[cfg(feature = "std")]
+    #[test]
+    fn resolve_wakes_a_responder_that_is_already_waiting() {
+        use core::future::Future;
+        use core::pin::pin;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use core::task::{Context, Waker};
+        use std::sync::Arc;
+        use std::task::Wake;
+
+        struct Woken(AtomicBool);
+
+        impl Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let matter = test_matter();
+
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let mut responder = pin!(matter.transport().wait_mdns_resolve_request());
+        assert!(responder.as_mut().poll(&mut cx).is_pending());
+
+        // The caller shares the responder's waker, so its own registration
+        // displaces nothing that would wake.
+        let mut resolver = pin!(matter.transport().resolve_commissionable_addrs(1));
+        assert!(resolver.as_mut().poll(&mut cx).is_pending());
+
+        assert!(
+            woken.0.load(Ordering::SeqCst),
+            "placing the request did not wake the waiting responder"
+        );
+        assert!(responder.as_mut().poll(&mut cx).is_ready());
     }
 
     /// Commissionable nodes are listed only if they match the filter.
