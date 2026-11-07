@@ -207,4 +207,16 @@ impl<'a> StatusReport<'a> {
 
         Ok(())
     }
+
+    /// The error a session-establishment initiator fails with when the peer
+    /// answers with this (non-success) status report.
+    pub fn establishment_error(&self) -> Error {
+        if self.proto_id == PROTO_ID_SECURE_CHANNEL as u32
+            && self.proto_code == SCStatusCodes::NoSharedTrustRoots as u16
+        {
+            ErrorCode::NoSharedTrustRoots.into()
+        } else {
+            ErrorCode::Invalid.into()
+        }
+    }
 }

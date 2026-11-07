@@ -37,7 +37,9 @@ use crate::transport::exchange::Exchange;
 use crate::transport::session::{PeerMrpParams, ReservedSession, SessionMode};
 use crate::utils::storage::ReadBuf;
 use crate::ScHost;
-use crate::{complete_with_status, GeneralCode, OpCode, SCStatusCodes, StatusReport};
+use crate::{
+    complete_with_status, expect_session_establishment_success, OpCode, SCStatusCodes, StatusReport,
+};
 
 use super::{PBKDFParamReq, PBKDFParamResp, Pake1, Pake2, Pake3, SPAKE2_SESSION_KEYS_INFO};
 
@@ -348,36 +350,7 @@ impl<'a, M: ScHost, C: Crypto> PaseInitiator<'a, M, C> {
             .await?;
 
         // Receive StatusReport
-        exchange.recv_fetch().await?;
-
-        let rx = exchange.rx()?;
-        let meta = rx.meta();
-
-        // Verify opcode
-        if meta.proto_opcode != OpCode::StatusReport as u8 {
-            error!(
-                "Unexpected opcode: expected StatusReport, got {}",
-                meta.proto_opcode
-            );
-            return Err(ErrorCode::InvalidOpcode.into());
-        }
-
-        // Parse StatusReport
-        let mut rb = ReadBuf::new(rx.payload());
-        let status = StatusReport::read(&mut rb)?;
-
-        // Check for success
-        if status.general_code != GeneralCode::Success
-            || status.proto_code != SCStatusCodes::SessionEstablishmentSuccess as u16
-        {
-            error!(
-                "PASE failed: general={:?}, proto_code={}",
-                status.general_code, status.proto_code
-            );
-            return Err(ErrorCode::Invalid.into());
-        }
-
-        Ok(())
+        expect_session_establishment_success(exchange).await
     }
 
     /// Complete session establishment
