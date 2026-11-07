@@ -51,3 +51,5 @@ mod reexport {
 }
 
 include!(concat!(env!("OUT_DIR"), "/clusters_generated.rs"));
+
+mod noc_status;
