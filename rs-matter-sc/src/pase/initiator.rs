@@ -35,10 +35,10 @@ use crate::pase::spake2p::{
 use crate::tlv::{FromTLV, OctetStr, TLVElement, TagType, ToTLV};
 use crate::transport::exchange::Exchange;
 use crate::transport::session::{PeerMrpParams, ReservedSession, SessionMode};
-use crate::utils::storage::ReadBuf;
 use crate::ScHost;
 use crate::{
-    complete_with_status, expect_session_establishment_success, OpCode, SCStatusCodes, StatusReport,
+    complete_with_status, expect_session_establishment_success, fail_on_status_report, OpCode,
+    SCStatusCodes,
 };
 
 use super::{PBKDFParamReq, PBKDFParamResp, Pake1, Pake2, Pake3, SPAKE2_SESSION_KEYS_INFO};
@@ -194,19 +194,10 @@ impl<'a, M: ScHost, C: Crypto> PaseInitiator<'a, M, C> {
         // Receive response
         exchange.recv_fetch().await?;
 
+        fail_on_status_report(exchange, "PASE PBKDFParamRequest")?;
+
         let rx = exchange.rx()?;
         let meta = rx.meta();
-
-        // Check for StatusReport (error case)
-        if meta.proto_opcode == OpCode::StatusReport as u8 {
-            let mut rb = ReadBuf::new(rx.payload());
-            let status = StatusReport::read(&mut rb)?;
-            error!(
-                "PASE failed: general={:?}, proto_code={}",
-                status.general_code, status.proto_code
-            );
-            return Err(ErrorCode::Invalid.into());
-        }
 
         // Verify opcode
         if meta.proto_opcode != OpCode::PBKDFParamResponse as u8 {
@@ -289,19 +280,10 @@ impl<'a, M: ScHost, C: Crypto> PaseInitiator<'a, M, C> {
         // Receive Pake2
         exchange.recv_fetch().await?;
 
+        fail_on_status_report(exchange, "PASE Pake1")?;
+
         let rx = exchange.rx()?;
         let meta = rx.meta();
-
-        // Check for StatusReport (error case)
-        if meta.proto_opcode == OpCode::StatusReport as u8 {
-            let mut rb = ReadBuf::new(rx.payload());
-            let status = StatusReport::read(&mut rb)?;
-            error!(
-                "PASE Pake1 failed: general={:?}, proto_code={}",
-                status.general_code, status.proto_code
-            );
-            return Err(ErrorCode::Invalid.into());
-        }
 
         // Verify opcode
         if meta.proto_opcode != OpCode::PASEPake2 as u8 {

@@ -37,11 +37,10 @@ use crate::tlv::{get_root_node_struct, FromTLV, OctetStr, TLVElement, TLVTag, TL
 use crate::transport::exchange::Exchange;
 use crate::transport::session::{NocCatIds, PeerMrpParams, ReservedSession, SessionMode};
 use crate::utils::init::InitMaybeUninit;
-use crate::utils::storage::ReadBuf;
 use crate::ScHost;
 use crate::{
-    complete_with_status, expect_session_establishment_success, OpCode, SCStatusCodes,
-    SessionParameters, StatusReport,
+    complete_with_status, expect_session_establishment_success, fail_on_status_report, OpCode,
+    SCStatusCodes, SessionParameters,
 };
 
 #[cfg(feature = "case-resumption")]
@@ -278,18 +277,9 @@ impl<'a, C: Crypto + 'a> CaseInitiator<'a, C> {
         // Step 4: Receive Sigma2, Sigma2_Resume, or an error StatusReport
         exchange.recv_fetch().await?;
 
-        let response_opcode = exchange.rx()?.meta().proto_opcode;
+        fail_on_status_report(&exchange, "CASE Sigma1")?;
 
-        if response_opcode == OpCode::StatusReport as u8 {
-            let rx = exchange.rx()?;
-            let mut rb = ReadBuf::new(rx.payload());
-            let status = StatusReport::read(&mut rb)?;
-            error!(
-                "CASE Sigma1 failed: general={:?}, proto_code={}",
-                status.general_code, status.proto_code
-            );
-            return Err(status.establishment_error());
-        }
+        let response_opcode = exchange.rx()?.meta().proto_opcode;
 
         // We only ever offer resumption when `case-resumption` is on, so a
         // spec-compliant responder never sends Sigma2_Resume otherwise; the
