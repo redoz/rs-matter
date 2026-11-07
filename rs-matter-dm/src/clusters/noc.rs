@@ -1077,3 +1077,40 @@ const FABRIC_BINDING_VERSION_1: u8 = 1;
 /// `ClientChallenge` is fixed at 32 octets (cluster XML
 /// `length="32" minLength="32"` on `SignVIDVerificationRequest`).
 const VID_VERIFY_CLIENT_CHALLENGE_LEN: usize = 32;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::NodeOperationalCertStatusEnum as Status;
+    use super::NodeOperationalCertStatusMap as _;
+    use crate::error::{Error, ErrorCode};
+
+    /// Every status a device can answer `AddNOC` with reaches the commissioner
+    /// named, and the names are the ones the device's own handler maps from,
+    /// so a status survives the round trip.
+    #[test]
+    fn a_noc_response_status_is_named_for_the_commissioner() {
+        assert!(Status::OK.result().is_ok());
+        assert_eq!(
+            Status::FabricConflict.result().unwrap_err().code(),
+            ErrorCode::NocFabricConflict
+        );
+        assert_eq!(
+            Status::InvalidNodeOpId.result().unwrap_err().code(),
+            ErrorCode::NocInvalidNodeOpId
+        );
+        for status in [
+            Status::InvalidPublicKey,
+            Status::InvalidNOC,
+            Status::MissingCsr,
+            Status::TableFull,
+            Status::InvalidAdminSubject,
+            Status::FabricConflict,
+            Status::LabelConflict,
+            Status::InvalidFabricIndex,
+        ] {
+            let error: Error = status.result().unwrap_err();
+            assert_eq!(Status::map(Err(error)).unwrap(), status, "{status:?}");
+        }
+    }
+}
