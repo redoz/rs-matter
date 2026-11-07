@@ -207,4 +207,73 @@ impl<'a> StatusReport<'a> {
 
         Ok(())
     }
+
+    /// The error a session-establishment initiator fails with when the peer
+    /// answers with this (non-success) status report.
+    ///
+    /// The two Secure Channel refusals a caller can act on are named:
+    /// `NoSharedTrustRoots` (the responder holds no fabric matching our
+    /// destination identifier - it does not, or no longer, trusts us) becomes
+    /// `ErrorCode::NoSharedTrustRoots`, and `Busy` (the responder is out of
+    /// resources for now and may be retried) becomes `ErrorCode::Busy`.
+    /// Anything else stays the generic `ErrorCode::Invalid`.
+    pub fn establishment_error(&self) -> Error {
+        let secure_channel = self.proto_id == PROTO_ID_SECURE_CHANNEL as u32;
+
+        if secure_channel && self.proto_code == SCStatusCodes::NoSharedTrustRoots as u16 {
+            ErrorCode::NoSharedTrustRoots.into()
+        } else if self.general_code == GeneralCode::Busy
+            || (secure_channel && self.proto_code == SCStatusCodes::Busy as u16)
+        {
+            ErrorCode::Busy.into()
+        } else {
+            ErrorCode::Invalid.into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GeneralCode, SCStatusCodes, StatusReport, PROTO_ID_SECURE_CHANNEL};
+    use crate::error::ErrorCode;
+
+    /// A refusal the initiator can act on is named; anything else stays
+    /// `Invalid`.
+    #[test]
+    fn establishment_error_names_no_shared_trust_roots_and_busy() {
+        let code = |status: StatusReport<'_>| status.establishment_error().code();
+
+        assert_eq!(
+            code(SCStatusCodes::NoSharedTrustRoots.as_report(&[])),
+            ErrorCode::NoSharedTrustRoots
+        );
+        // `Busy` carries the minimum wait time as protocol data.
+        assert_eq!(
+            code(SCStatusCodes::Busy.as_report(&[0xe8, 0x03])),
+            ErrorCode::Busy
+        );
+        assert_eq!(
+            code(SCStatusCodes::InvalidParameter.as_report(&[])),
+            ErrorCode::Invalid
+        );
+        assert_eq!(
+            code(StatusReport {
+                general_code: GeneralCode::Failure,
+                proto_id: PROTO_ID_SECURE_CHANNEL as u32,
+                proto_code: 0xffff,
+                proto_data: &[],
+            }),
+            ErrorCode::Invalid
+        );
+        // Another protocol's code 1 is not a Secure Channel refusal.
+        assert_eq!(
+            code(StatusReport {
+                general_code: GeneralCode::Failure,
+                proto_id: 0x0001,
+                proto_code: SCStatusCodes::NoSharedTrustRoots as u16,
+                proto_data: &[],
+            }),
+            ErrorCode::Invalid
+        );
+    }
 }

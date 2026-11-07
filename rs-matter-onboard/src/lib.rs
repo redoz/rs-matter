@@ -81,9 +81,7 @@ use crate::transport::TransportPreference;
 use rs_matter_dm_clusters::general_commissioning::{
     CommissioningErrorEnum, GeneralCommissioningClient,
 };
-use rs_matter_dm_clusters::operational_credentials::{
-    NodeOperationalCertStatusEnum, OperationalCredentialsClient,
-};
+use rs_matter_dm_clusters::operational_credentials::OperationalCredentialsClient;
 
 // The dependencies, under the names the code uses for them
 use rs_matter_cert as cert;
@@ -668,9 +666,10 @@ impl<'a, 'b, C: Crypto> Commissioner<'a, 'b, C> {
 
         handle.complete().await?;
 
-        if status != NodeOperationalCertStatusEnum::OK {
-            return Err(ErrorCode::Failure.into());
-        }
+        // A refused `AddNOC` is named (`NocFabricConflict`, `NocFabricTableFull`,
+        // ...): the device already holding this fabric and the device being
+        // out of fabric slots call for different remedies.
+        status.result()?;
 
         // Spec reserves `fabric_index=0` for PASE / no-fabric; the
         // device must assign a non-zero slot on a successful `AddNOC`.

@@ -268,6 +268,75 @@ async fn expect_opcode(exchange: &mut Exchange<'_>, opcode: OpCode) -> Result<()
     }
 }
 
+/// Fail the step of a session establishment this node initiated if the
+/// message it just received is a `StatusReport`: the responder refused, and
+/// the refusal is named by [`StatusReport::establishment_error`]. `step`
+/// names the step in the log. `Ok` for any other message, which the caller
+/// then checks for the opcode it expects.
+///
+/// Every initiator step that can be answered with a refusal goes through
+/// here (CASE Sigma1, PASE PBKDFParamRequest and Pake1), so a responder's
+/// `Busy` or `NoSharedTrustRoots` reads the same whichever step it answered.
+fn fail_on_status_report(exchange: &Exchange<'_>, step: &str) -> Result<(), Error> {
+    let rx = exchange.rx()?;
+
+    status_report_refusal(rx.meta().proto_opcode, rx.payload(), step)
+}
+
+/// [`fail_on_status_report`] over the received message's protocol opcode
+/// and payload.
+fn status_report_refusal(proto_opcode: u8, payload: &[u8], step: &str) -> Result<(), Error> {
+    if proto_opcode != OpCode::StatusReport as u8 {
+        return Ok(());
+    }
+
+    let mut rb = ReadBuf::new(payload);
+    let status = StatusReport::read(&mut rb)?;
+    error!(
+        "{} refused: general={:?}, proto_code={}",
+        step, status.general_code, status.proto_code
+    );
+
+    Err(status.establishment_error())
+}
+
+/// Receive the message that closes a session establishment this node initiated
+/// (the final message of CASE and of PASE) and require it to be a
+/// `StatusReport(SUCCESS, SESSION_ESTABLISHMENT_SUCCESS)`.
+///
+/// Fails with `InvalidOpcode` if the message is not a `StatusReport` at all,
+/// and with [`StatusReport::establishment_error`] if it reports anything but
+/// success.
+async fn expect_session_establishment_success(exchange: &mut Exchange<'_>) -> Result<(), Error> {
+    exchange.recv_fetch().await?;
+
+    let rx = exchange.rx()?;
+    let meta = rx.meta();
+
+    if meta.proto_opcode != OpCode::StatusReport as u8 {
+        error!(
+            "Unexpected opcode: expected StatusReport, got {}",
+            meta.proto_opcode
+        );
+        return Err(ErrorCode::InvalidOpcode.into());
+    }
+
+    let mut rb = ReadBuf::new(rx.payload());
+    let status = StatusReport::read(&mut rb)?;
+
+    if status.general_code != GeneralCode::Success
+        || status.proto_code != SCStatusCodes::SessionEstablishmentSuccess as u16
+    {
+        error!(
+            "Session establishment failed: general={:?}, proto_code={}",
+            status.general_code, status.proto_code
+        );
+        return Err(status.establishment_error());
+    }
+
+    Ok(())
+}
+
 /// Check that the opcode of the received message matches the expected one.
 /// Logs an error if that's not the case, and if the opcode is `StatusReport`,
 /// it also logs the details of the status report.
@@ -297,6 +366,7 @@ fn check_opcode(exchange: &Exchange<'_>, opcode: OpCode) -> Result<(), Error> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use crate::error::ErrorCode;
     use crate::im::IM_REVISION;
     use crate::transport::mrp::MRP_BASE_RETRY_INTERVAL_MS;
     use crate::transport::{Transport, TransportHost};
@@ -307,6 +377,38 @@ mod tests {
     };
     use rs_matter_node_core::icd::{IcdAdvertisement, IcdOperatingMode};
     use rs_matter_node_core::test_device::TEST_DEV_DET;
+
+    /// Every initiator step's refusal check (CASE Sigma1, PASE
+    /// PBKDFParamRequest and Pake1) names a `StatusReport` the same way, and
+    /// lets any other message through to the step's own opcode check.
+    #[test]
+    fn a_status_report_at_any_initiator_step_is_named() {
+        use super::{status_report_refusal, OpCode, SCStatusCodes};
+        use crate::utils::storage::WriteBuf;
+
+        let report = |code: SCStatusCodes, payload: &[u8]| {
+            let mut buf = [0u8; 32];
+            let mut wb = WriteBuf::new(&mut buf);
+            code.as_report(payload).write(&mut wb).unwrap();
+            wb.as_slice().to_vec()
+        };
+        let status = OpCode::StatusReport as u8;
+
+        let busy = report(SCStatusCodes::Busy, &[0xe8, 0x03]);
+        for step in ["CASE Sigma1", "PASE PBKDFParamRequest", "PASE Pake1"] {
+            let err = status_report_refusal(status, &busy, step).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Busy, "{step}");
+        }
+        let refused = report(SCStatusCodes::NoSharedTrustRoots, &[]);
+        assert_eq!(
+            status_report_refusal(status, &refused, "CASE Sigma1")
+                .unwrap_err()
+                .code(),
+            ErrorCode::NoSharedTrustRoots
+        );
+        // Not a StatusReport: the step's own opcode check decides.
+        assert!(status_report_refusal(OpCode::PASEPake2 as u8, &busy, "PASE Pake1").is_ok());
+    }
 
     /// A node with what `local_session_parameters` reads from it.
     struct TestHost {
